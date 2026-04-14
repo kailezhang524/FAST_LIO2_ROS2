@@ -152,6 +152,7 @@ void ImuProcess::UndistortPcl(
   double dt = 0;
 
   input_ikfom in;
+  // 遍历本次估计的所有IMU测量并且进行积分，离散中值法 前向传播
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++) {
     auto &&head = *(it_imu);
     auto &&tail = *(it_imu + 1);
@@ -205,13 +206,14 @@ void ImuProcess::UndistortPcl(
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  // IMU前向传播，每次传播的时间间隔为dt
   kf_state.predict(dt, Q, in);
 
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
-  /*** undistort each lidar point (backward propagation) ***/
+  /*** 在处理完所有的IMU预测后，剩下的就是对激光的去畸变了 ***/
   if (pcl_out.points.begin() == pcl_out.points.end()) return;
   auto it_pcl = pcl_out.points.end() - 1;
   for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--) {

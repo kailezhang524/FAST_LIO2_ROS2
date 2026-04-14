@@ -4,22 +4,39 @@ PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
 LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions &options)
     : Node("laser_mapping", options),
-      pcl_wait_pub(new PointCloudXYZI()),
-      pcl_wait_save(new PointCloudXYZI()),
-      featsFromMap(new PointCloudXYZI()),
-      feats_undistort(new PointCloudXYZI()),
-      feats_down_body(new PointCloudXYZI()),
-      feats_down_world(new PointCloudXYZI()),
-      normvec(new PointCloudXYZI(100000, 1)),
       extrinT(3, 0.0),
       extrinR(9, 0.0),
       XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0),
       XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0),
       position_last(Zero3d),
       Lidar_T_wrt_IMU(Zero3d),
-      Lidar_R_wrt_IMU(Eye3d),
-      p_pre(new Preprocess()),
-      p_imu(new ImuProcess()) {
+      Lidar_R_wrt_IMU(Eye3d) {
+  p_pre.reset(new Preprocess());
+  p_imu.reset(new ImuProcess());
+  pcl_wait_pub.reset(new PointCloudXYZI());
+  pcl_wait_save.reset(new PointCloudXYZI());
+  featsFromMap.reset(new PointCloudXYZI());
+  feats_undistort.reset(new PointCloudXYZI());
+  feats_down_body.reset(new PointCloudXYZI());
+  feats_down_world.reset(new PointCloudXYZI());
+  normvec.reset(new PointCloudXYZI(100000, 1));
+  readParameters();
+  // 初始化path的header（包括时间戳和帧id），path用于保存odemetry的路径
+  path.header.stamp = this->get_clock()->now();
+  path.header.frame_id = "camera_init";
+  initializeComponents();
+  initializeFiles();
+  initializeSubscribersAndPublishers();
+  RCLCPP_INFO(this->get_logger(), "Node init finished.");
+}
+//--------------------init-------------------------//
+LaserMappingNode::~LaserMappingNode() {
+  fout_out.close();
+  fout_pre.close();
+  fclose(fp);
+}
+
+void LaserMappingNode::readParameters() {
   this->declare_parameter<bool>("publish.path_en", true);
   this->declare_parameter<bool>("publish.effect_map_en", false);
   this->declare_parameter<bool>("publish.map_en", false);
@@ -78,7 +95,6 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions &options)
   this->get_parameter_or<double>("filter_size_map", filter_size_map_min, 0.5);
   this->get_parameter_or<double>("cube_side_length", cube_len, 200.f);
   this->get_parameter_or<float>("mapping.det_range", DET_RANGE, 300.f);
-  this->get_parameter_or<double>("mapping.fov_degree", fov_deg, 180.f);
   this->get_parameter_or<double>("mapping.gyr_cov", gyr_cov, 0.1);
   this->get_parameter_or<double>("mapping.acc_cov", acc_cov, 0.1);
   this->get_parameter_or<double>("mapping.b_gyr_cov", b_gyr_cov, 0.0001);
@@ -101,51 +117,45 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions &options)
                                          vector<double>());
   this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR,
                                          vector<double>());
-
   RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+}
 
-  path.header.stamp = this->get_clock()->now();
-  path.header.frame_id = "camera_init";
-
-  // /*** variables definition ***/
-  // int effect_feat_num = 0, frame_num = 0;
-  // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0,
-  // aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0,
-  // aver_time_const_H_time = 0; bool flg_EKF_converged, EKF_stop_flg = 0;
-
-  FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
-  HALF_FOV_COS = cos((FOV_DEG)*0.5 * PI_M / 180.0);
-
-  _featsArray.reset(new PointCloudXYZI());
-
+void LaserMappingNode::initializeComponents() {
+  // 将数组point_selected_surf内元素的值全部设为true，数组point_selected_surf用于选择平面点
   memset(point_selected_surf, true, sizeof(point_selected_surf));
   memset(res_last, -1000.0f, sizeof(res_last));
   downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min,
                                  filter_size_surf_min);
   downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min,
                                 filter_size_map_min);
-  memset(point_selected_surf, true, sizeof(point_selected_surf));
-  memset(res_last, -1000.0f, sizeof(res_last));
+  // memset(point_selected_surf, true, sizeof(point_selected_surf));
+  // memset(res_last, -1000.0f, sizeof(res_last));
 
   Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
   Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
+  // 设置IMU的参数，
   p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
   p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
   p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
   p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
   p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
 
-  fill(epsi, epsi + 23, 0.001);
-  //不安全 ，可用std::function + lambda
+  fill(epsi, epsi + 23, 0.001);  //从epsi填充到epsi+22 也就是全部数组置0.001
+                                 //不安全 ，可用std::function + lambda
   static LaserMappingNode *p_node = nullptr;
   p_node = this;
   auto static_lambda = [](state_ikfom &s,
                           esekfom::dyn_share_datastruct<double> &ds) {
     p_node->h_share_model(s, ds);
   };
+  // 将函数地址传入kf对象中，用于接收特定于系统的模型及其差异
+  // 作为一个维数变化的特征矩阵进行测量。
+  // 通过一个函数（h_dyn_share_in）同时计算测量（z）、估计测量（h）、偏微分矩阵（h_x，h_v）和噪声协方差（R）。
   kf.init_dyn_share(get_f, df_dx, df_dw, static_lambda, NUM_MAX_ITERATIONS,
                     epsi);
+}
 
+void LaserMappingNode::initializeFiles() {
   /*** debug record ***/
   // FILE *fp;
   string pos_log_dir = root_dir + "/Log/pos_log.txt";
@@ -159,8 +169,11 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions &options)
     cout << "~~~~" << ROOT_DIR << " file opened" << endl;
   else
     cout << "~~~~" << ROOT_DIR << " doesn't exist" << endl;
+}
 
+void LaserMappingNode::initializeSubscribersAndPublishers() {
   /*** ROS subscribe initialization ***/
+  // 雷达点云的订阅器sub_pcl，订阅点云的topic
   if (p_pre->lidar_type == AVIA) {
     //可以用lambda,但是不能传uniqueptr
     sub_pcl_livox_ =
@@ -177,8 +190,10 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions &options)
   sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
       imu_topic, 10,
       std::bind(&LaserMappingNode::imu_cbk, this, std::placeholders::_1));
+  // 发布当前正在扫描的点云，topic名字为/cloud_registered
   pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/cloud_registered", 20);
+  // 发布经过运动畸变校正到IMU坐标系的点云，
   pubLaserCloudFull_body_ =
       this->create_publisher<sensor_msgs::msg::PointCloud2>(
           "/cloud_registered_body", 20);
@@ -206,15 +221,8 @@ LaserMappingNode::LaserMappingNode(const rclcpp::NodeOptions &options)
   map_save_srv_ = this->create_service<std_srvs::srv::Trigger>(
       "map_save", std::bind(&LaserMappingNode::map_save_callback, this,
                             std::placeholders::_1, std::placeholders::_2));
-
-  RCLCPP_INFO(this->get_logger(), "Node init finished.");
 }
 
-LaserMappingNode::~LaserMappingNode() {
-  fout_out.close();
-  fout_pre.close();
-  fclose(fp);
-}
 //--------------------callbacks--------------------//
 void LaserMappingNode::standard_pcl_cbk(
     const sensor_msgs::msg::PointCloud2::UniquePtr msg) {
@@ -271,6 +279,7 @@ void LaserMappingNode::livox_pcl_cbk(
   }
 
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+  // 对激光雷达数据进行预处理（特征提取或者降采样）
   p_pre->process(msg, ptr);
   lidar_buffer.push_back(ptr);
   time_buffer.push_back(last_timestamp_lidar);
@@ -309,6 +318,7 @@ void LaserMappingNode::imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in) {
 }
 
 void LaserMappingNode::timer_callback() {
+  // 将激光雷达点云数据和IMU数据从缓存队列中取出，进行时间对齐，并保存到Measures中
   if (sync_packages(Measures)) {
     if (flg_first_scan) {
       first_lidar_time = Measures.lidar_beg_time;
@@ -338,6 +348,7 @@ void LaserMappingNode::timer_callback() {
     flg_EKF_inited =
         (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
     /*** Segment the map in lidar FOV ***/
+    // 动态调整局部地图,在拿到eskf前馈结果后
     lasermap_fov_segment();
 
     /*** downsample the feature points in a scan ***/
@@ -355,10 +366,11 @@ void LaserMappingNode::timer_callback() {
           pointBodyToWorld(&(feats_down_body->points[i]),
                            &(feats_down_world->points[i]));
         }
-        ikdtree.Build(feats_down_world->points);
+        ikdtree.Build(feats_down_world->points);  //构建ikd树
       }
       return;
     }
+
     int featsFromMapNum = ikdtree.validnum();
     kdtree_size_st = ikdtree.size();
 
@@ -371,7 +383,7 @@ void LaserMappingNode::timer_callback() {
       RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
       return;
     }
-
+    // ICP和迭代卡尔曼滤波更新
     normvec->resize(feats_down_size);
     feats_down_world->resize(feats_down_size);
 
@@ -398,7 +410,7 @@ void LaserMappingNode::timer_callback() {
     bool nearest_search_en = true;  //
 
     t2 = omp_get_wtime();
-
+    /*** 迭代状态估计 ***/
     /*** iterated state estimation ***/
     double t_update_start = omp_get_wtime();
     double solve_H_time = 0;
@@ -497,16 +509,18 @@ void LaserMappingNode::map_save_callback(
 }
 
 //--------------------------------functions-----------------------------
+//地图的增量更新，主要完成对ikd-tree的地图建立
 void LaserMappingNode::map_incremental() {
   PointVector PointToAdd;
   PointVector PointNoNeedDownsample;
   PointToAdd.reserve(feats_down_size);
   PointNoNeedDownsample.reserve(feats_down_size);
+  //根据点与所在包围盒中心点的距离，分类是否需要降采样
   for (int i = 0; i < feats_down_size; i++) {
     /* transform to world frame */
     pointBodyToWorld(&(feats_down_body->points[i]),
                      &(feats_down_world->points[i]));
-    /* decide if need add to map */
+    // 判断是否有关键点需要加到地图中
     if (!Nearest_Points[i].empty() && flg_EKF_inited) {
       const PointVector &points_near = Nearest_Points[i];
       bool need_add = true;
@@ -521,15 +535,20 @@ void LaserMappingNode::map_incremental() {
       mid_point.z = floor(feats_down_world->points[i].z / filter_size_map_min) *
                         filter_size_map_min +
                     0.5 * filter_size_map_min;
+      // 当前点与box中心的距离
       float dist = calc_dist(feats_down_world->points[i], mid_point);
+      //判断最近点在x、y、z三个方向上，与中心的距离，判断是否加入时需要降采样
       if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min &&
           fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min &&
           fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min) {
+        //若三个方向距离都大于地图栅格半轴长，无需降采样
         PointNoNeedDownsample.push_back(feats_down_world->points[i]);
         continue;
       }
+      //判断当前点的 NUM_MATCH_POINTS 个邻近点与包围盒中心的范围
       for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i++) {
         if (points_near.size() < NUM_MATCH_POINTS) break;
+        // 如果存在邻近点到中心的距离小于当前点到中心的距离，则不需要添加当前点
         if (calc_dist(points_near[readd_i], mid_point) < dist) {
           need_add = false;
           break;
@@ -547,7 +566,7 @@ void LaserMappingNode::map_incremental() {
   add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
   kdtree_incremental_time = omp_get_wtime() - st_time;
 }
-
+//得到被剔除的点
 void LaserMappingNode::points_cache_collect() {
   PointVector points_history;
   ikdtree.acquire_removed_points(points_history);
@@ -561,6 +580,7 @@ void LaserMappingNode::lasermap_fov_segment() {
   kdtree_delete_time = 0.0;
   pointBodyToWorld(XAxisPoint_body, XAxisPoint_world);
   V3D pos_LiD = pos_lid;
+  //初始化局部地图包围盒角点
   if (!Localmap_Initialized) {
     for (int i = 0; i < 3; i++) {
       LocalMap_Points.vertex_min[i] = pos_LiD(i) - cube_len / 2.0;
@@ -569,8 +589,9 @@ void LaserMappingNode::lasermap_fov_segment() {
     Localmap_Initialized = true;
     return;
   }
-  float dist_to_map_edge[3][2];
+  float dist_to_map_edge[3][2];  // lidar与立方体盒子六个面的距离
   bool need_move = false;
+  // 当前雷达系中心到各个地图边缘的距离
   for (int i = 0; i < 3; i++) {
     dist_to_map_edge[i][0] = fabs(pos_LiD(i) - LocalMap_Points.vertex_min[i]);
     dist_to_map_edge[i][1] = fabs(pos_LiD(i) - LocalMap_Points.vertex_max[i]);
@@ -580,11 +601,13 @@ void LaserMappingNode::lasermap_fov_segment() {
   }
   if (!need_move) return;
   BoxPointType New_LocalMap_Points, tmp_boxpoints;
+  // 新的局部地图盒子边界点
   New_LocalMap_Points = LocalMap_Points;
   float mov_dist = max((cube_len - 2.0 * MOV_THRESHOLD * DET_RANGE) * 0.5 * 0.9,
                        double(DET_RANGE * (MOV_THRESHOLD - 1)));
   for (int i = 0; i < 3; i++) {
     tmp_boxpoints = LocalMap_Points;
+    //与包围盒最小值边界点距离
     if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE) {
       New_LocalMap_Points.vertex_max[i] -= mov_dist;
       New_LocalMap_Points.vertex_min[i] -= mov_dist;
@@ -601,6 +624,7 @@ void LaserMappingNode::lasermap_fov_segment() {
 
   points_cache_collect();
   double delete_begin = omp_get_wtime();
+  // 使用Boxs删除指定盒内的点
   if (cub_needrm.size() > 0)
     kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm);
   kdtree_delete_time = omp_get_wtime() - delete_begin;
@@ -661,7 +685,7 @@ void LaserMappingNode::save_to_pcd() {
   pcl::PCDWriter pcd_writer;
   pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
-
+//计算残差信息
 void LaserMappingNode::h_share_model(
     state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data) {
   double match_start = omp_get_wtime();
@@ -669,11 +693,12 @@ void LaserMappingNode::h_share_model(
   corr_normvect->clear();
   total_residual = 0.0;
 
-/** closest surface search and residual computation **/
+/** 最接近曲面搜索和残差计算  **/
 #ifdef MP_EN
   omp_set_num_threads(MP_PROC_NUM);
 #pragma omp parallel for
 #endif
+  //对降采样后的每个特征点进行残差计算
   for (int i = 0; i < feats_down_size; i++) {
     PointType &point_body = feats_down_body->points[i];
     PointType &point_world = feats_down_world->points[i];
@@ -690,8 +715,8 @@ void LaserMappingNode::h_share_model(
 
     auto &points_near = Nearest_Points[i];
 
-    if (ekfom_data.converge) {
-      /** Find the closest surfaces in the map **/
+    if (ekfom_data.converge) {  //如果收敛了
+      //在已构造的地图上查找特征点的最近邻(NUM_MATCH_POINTS)
       ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near,
                              pointSearchSqDis);
       point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false
@@ -702,17 +727,17 @@ void LaserMappingNode::h_share_model(
 
     if (!point_selected_surf[i]) continue;
 
-    VF(4)
-    pabcd;
+    VF(4) pabcd;
     point_selected_surf[i] = false;
+    //拟合平面方程ax+by+cz+d=0并求解点到平面距离
     if (esti_plane(pabcd, points_near, 0.1f)) {
       float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y +
-                  pabcd(2) * point_world.z + pabcd(3);
-      float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+                  pabcd(2) * point_world.z + pabcd(3);  //计算点到平面的距离
+      float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());  //计算残差
 
       if (s > 0.9) {
         point_selected_surf[i] = true;
-        normvec->points[i].x = pabcd(0);
+        normvec->points[i].x = pabcd(0);  //将法向量存储至normvec
         normvec->points[i].y = pabcd(1);
         normvec->points[i].z = pabcd(2);
         normvec->points[i].intensity = pd2;
@@ -721,13 +746,13 @@ void LaserMappingNode::h_share_model(
     }
   }
 
-  effct_feat_num = 0;
+  effct_feat_num = 0;  //有效特征点数
 
   for (int i = 0; i < feats_down_size; i++) {
     if (point_selected_surf[i]) {
       laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
       corr_normvect->points[effct_feat_num] = normvec->points[i];
-      total_residual += res_last[i];
+      total_residual += res_last[i];  //计算总残差
       effct_feat_num++;
     }
   }
@@ -739,14 +764,14 @@ void LaserMappingNode::h_share_model(
     return;
   }
 
-  res_mean_last = total_residual / effct_feat_num;
+  res_mean_last = total_residual / effct_feat_num;  //计算残差平均值
   match_time += omp_get_wtime() - match_start;
   double solve_start_ = omp_get_wtime();
 
-  /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
+  // 测量雅可比矩阵H和测量向量的计算 H=J*P*J'
   ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);  // 23
   ekfom_data.h.resize(effct_feat_num);
-
+  //求观测值与误差的雅克比矩阵，
   for (int i = 0; i < effct_feat_num; i++) {
     const PointType &laser_p = laserCloudOri->points[i];
     V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
@@ -773,7 +798,7 @@ void LaserMappingNode::h_share_model(
           VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
     }
 
-    /*** Measuremnt: distance to the closest surface/corner ***/
+    // 测量:到最近表面/角落的距离
     ekfom_data.h(i) = -norm_p.intensity;
   }
   solve_time += omp_get_wtime() - solve_start_;

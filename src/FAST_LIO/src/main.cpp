@@ -1,4 +1,5 @@
 #include "laser_mapping.hpp"
+//按下ctrl+c后唤醒所有线程
 void SigHandle(int sig) {
   // flg_exit = true;
   std::cout << "catch sig %d" << sig << std::endl;
@@ -8,6 +9,9 @@ void SigHandle(int sig) {
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
+  rclcpp::NodeOptions options;
+  options.allow_undeclared_parameters(true);
+  options.automatically_declare_parameters_from_overrides(true);
 
   // signal(SIGINT, SigHandle);
 
